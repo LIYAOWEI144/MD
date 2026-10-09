@@ -33,7 +33,7 @@ Use the dedicated local Conda environment:
   --output-dir 'D:\path\to\ligand_3d'
 ```
 
-For an approved 2D SDF or MOL file, use `--input path\\to\\ligand.sdf` instead of `--smiles`.
+For an approved ChemDraw `.cdxml`, 2D SDF, MOL, or MOL2 file, use `--input path\\to\\ligand.cdxml` instead of `--smiles`.
 
 Read `references/verification.md` before treating an image-derived structure as ready for docking or molecular dynamics.
 

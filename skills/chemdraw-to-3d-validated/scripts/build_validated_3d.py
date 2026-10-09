@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import sys
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 from rdkit import Chem
@@ -30,7 +31,9 @@ def load_source(args: argparse.Namespace) -> Chem.Mol:
         mol = Chem.MolFromSmiles(args.smiles)
     else:
         suffix = args.input.suffix.lower()
-        if suffix in {".sdf", ".sd"}:
+        if suffix == ".cdxml":
+            mol = load_cdxml(args.input)
+        elif suffix in {".sdf", ".sd"}:
             supplier = Chem.SDMolSupplier(str(args.input), removeHs=False)
             mol = next((item for item in supplier if item is not None), None)
         elif suffix == ".mol2":
@@ -41,6 +44,104 @@ def load_source(args: argparse.Namespace) -> Chem.Mol:
         raise ValueError("Could not read a valid molecular graph from the supplied source.")
     Chem.SanitizeMol(mol)
     return Chem.RemoveHs(mol)
+
+
+def load_cdxml(path: Path) -> Chem.Mol:
+    """Read an ordinary ChemDraw CDXML molecular drawing without guessing chemistry."""
+    root = ElementTree.parse(path).getroot()
+    fragments = root.findall(".//fragment")
+    if not fragments:
+        raise ValueError("The CDXML file contains no ChemDraw fragment.")
+    main = max(fragments, key=lambda fragment: len(fragment.findall("./n")))
+    direct_nodes = main.findall("./n")
+    direct_bonds = main.findall("./b")
+    atom_nodes = []
+    node_by_id = {}
+    replacement = {}
+    nested_bonds = []
+
+    for node in direct_nodes:
+        if node.get("NodeType") != "Fragment":
+            atom_nodes.append(node)
+            node_by_id[node.get("id")] = node
+            continue
+        child = node.find("./fragment")
+        if child is None:
+            raise ValueError("A ChemDraw fragment node has no embedded chemical fragment.")
+        child_nodes = [
+            item for item in child.findall("./n")
+            if item.get("NodeType") != "ExternalConnectionPoint"
+        ]
+        connection_ids = {
+            item.get("id") for item in child.findall("./n")
+            if item.get("NodeType") == "ExternalConnectionPoint"
+        }
+        child_bonds = child.findall("./b")
+        connected = {
+            bond.get("B") if bond.get("E") in connection_ids else bond.get("E")
+            for bond in child_bonds
+            if bond.get("B") in connection_ids or bond.get("E") in connection_ids
+        }
+        if len(connected) != 1:
+            raise ValueError("Could not identify the attachment atom of an embedded CDXML fragment.")
+        replacement[node.get("id")] = connected.pop()
+        for item in child_nodes:
+            atom_nodes.append(item)
+            node_by_id[item.get("id")] = item
+        nested_bonds.extend(child_bonds)
+
+    editable = Chem.RWMol()
+    atom_index = {}
+    for node in atom_nodes:
+        element = int(node.get("Element", "6"))
+        atom = Chem.Atom(element)
+        if node.get("Charge"):
+            atom.SetFormalCharge(int(node.get("Charge")))
+        atom_index[node.get("id")] = editable.AddAtom(atom)
+
+    bond_records = list(direct_bonds) + nested_bonds
+    seen = set()
+    for bond in bond_records:
+        begin = replacement.get(bond.get("B"), bond.get("B"))
+        end = replacement.get(bond.get("E"), bond.get("E"))
+        if begin not in atom_index or end not in atom_index or begin == end:
+            continue
+        pair = tuple(sorted((begin, end)))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        order = bond.get("Order", "1")
+        bond_type = {
+            "1": Chem.BondType.SINGLE,
+            "2": Chem.BondType.DOUBLE,
+            "3": Chem.BondType.TRIPLE,
+            "1.5": Chem.BondType.AROMATIC,
+        }.get(order)
+        if bond_type is None:
+            raise ValueError(f"Unsupported CDXML bond order: {order}")
+        editable.AddBond(atom_index[begin], atom_index[end], bond_type)
+
+    mol = editable.GetMol()
+    conformer = Chem.Conformer(mol.GetNumAtoms())
+    for node_id, index in atom_index.items():
+        x, y = (float(value) for value in node_by_id[node_id].get("p", "0 0").split())
+        conformer.SetAtomPosition(index, (x, -y, 0.0))
+    mol.AddConformer(conformer)
+    for bond in bond_records:
+        begin = replacement.get(bond.get("B"), bond.get("B"))
+        end = replacement.get(bond.get("E"), bond.get("E"))
+        if begin not in atom_index or end not in atom_index:
+            continue
+        rd_bond = mol.GetBondBetweenAtoms(atom_index[begin], atom_index[end])
+        if rd_bond is None:
+            continue
+        if bond.get("Display") == "WedgeBegin":
+            rd_bond.SetBondDir(Chem.BondDir.BEGINWEDGE)
+        elif bond.get("Display") == "WedgedHashBegin":
+            rd_bond.SetBondDir(Chem.BondDir.BEGINDASH)
+    Chem.SanitizeMol(mol)
+    Chem.AssignChiralTypesFromBondDirs(mol, conformer.GetId())
+    return mol
 
 
 def graph_signature(mol: Chem.Mol) -> dict:
@@ -85,7 +186,11 @@ def build_3d(source: Chem.Mol, seed: int, conformers: int) -> Chem.Mol:
     params = AllChem.ETKDGv3()
     params.randomSeed = seed
     params.pruneRmsThresh = 0.25
+    params.maxIterations = 4000
     ids = list(AllChem.EmbedMultipleConfs(molecule, numConfs=conformers, params=params))
+    if not ids:
+        params.useRandomCoords = True
+        ids = list(AllChem.EmbedMultipleConfs(molecule, numConfs=conformers, params=params))
     if not ids:
         raise RuntimeError("RDKit could not embed a 3D conformer for this molecular graph.")
     energies = []
