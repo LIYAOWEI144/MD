@@ -1,0 +1,3 @@
+interface:
+  display_name: "Chemdraw to 3d Validated"
+  short_description: "Build and verify 3D ligands from ChemDraw structures"
