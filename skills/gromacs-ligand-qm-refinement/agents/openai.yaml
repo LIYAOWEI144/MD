@@ -1,0 +1,4 @@
+interface:
+  display_name: "GROMACS Ligand QM Refinement"
+  short_description: "Parameterize and QM-refine ligands for GROMACS"
+  default_prompt: "Prepare my 3D ligand for GROMACS with a reproducible CHARMM/CGenFF and QM-refinement workflow, then deliver validated topology files."

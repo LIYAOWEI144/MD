@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--smiles", help="Confirmed isomeric SMILES.")
     source.add_argument("--input", type=Path, help="Approved 2D SDF, MOL, or MOL2 file.")
+    parser.add_argument(
+        "--expected-smiles",
+        help="Independent, confirmed isomeric SMILES used to audit a CDXML/SDF/MOL source before 3D generation.",
+    )
+    parser.add_argument("--expected-formula", help="Optional independently recorded molecular formula.")
+    parser.add_argument("--expected-charge", type=int, help="Optional independently recorded total formal charge.")
     parser.add_argument("--name", default="LIG", help="Residue and output molecule name.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20261009)
@@ -47,101 +53,11 @@ def load_source(args: argparse.Namespace) -> Chem.Mol:
 
 
 def load_cdxml(path: Path) -> Chem.Mol:
-    """Read an ordinary ChemDraw CDXML molecular drawing without guessing chemistry."""
-    root = ElementTree.parse(path).getroot()
-    fragments = root.findall(".//fragment")
-    if not fragments:
-        raise ValueError("The CDXML file contains no ChemDraw fragment.")
-    main = max(fragments, key=lambda fragment: len(fragment.findall("./n")))
-    direct_nodes = main.findall("./n")
-    direct_bonds = main.findall("./b")
-    atom_nodes = []
-    node_by_id = {}
-    replacement = {}
-    nested_bonds = []
-
-    for node in direct_nodes:
-        if node.get("NodeType") != "Fragment":
-            atom_nodes.append(node)
-            node_by_id[node.get("id")] = node
-            continue
-        child = node.find("./fragment")
-        if child is None:
-            raise ValueError("A ChemDraw fragment node has no embedded chemical fragment.")
-        child_nodes = [
-            item for item in child.findall("./n")
-            if item.get("NodeType") != "ExternalConnectionPoint"
-        ]
-        connection_ids = {
-            item.get("id") for item in child.findall("./n")
-            if item.get("NodeType") == "ExternalConnectionPoint"
-        }
-        child_bonds = child.findall("./b")
-        connected = {
-            bond.get("B") if bond.get("E") in connection_ids else bond.get("E")
-            for bond in child_bonds
-            if bond.get("B") in connection_ids or bond.get("E") in connection_ids
-        }
-        if len(connected) != 1:
-            raise ValueError("Could not identify the attachment atom of an embedded CDXML fragment.")
-        replacement[node.get("id")] = connected.pop()
-        for item in child_nodes:
-            atom_nodes.append(item)
-            node_by_id[item.get("id")] = item
-        nested_bonds.extend(child_bonds)
-
-    editable = Chem.RWMol()
-    atom_index = {}
-    for node in atom_nodes:
-        element = int(node.get("Element", "6"))
-        atom = Chem.Atom(element)
-        if node.get("Charge"):
-            atom.SetFormalCharge(int(node.get("Charge")))
-        atom_index[node.get("id")] = editable.AddAtom(atom)
-
-    bond_records = list(direct_bonds) + nested_bonds
-    seen = set()
-    for bond in bond_records:
-        begin = replacement.get(bond.get("B"), bond.get("B"))
-        end = replacement.get(bond.get("E"), bond.get("E"))
-        if begin not in atom_index or end not in atom_index or begin == end:
-            continue
-        pair = tuple(sorted((begin, end)))
-        if pair in seen:
-            continue
-        seen.add(pair)
-        order = bond.get("Order", "1")
-        bond_type = {
-            "1": Chem.BondType.SINGLE,
-            "2": Chem.BondType.DOUBLE,
-            "3": Chem.BondType.TRIPLE,
-            "1.5": Chem.BondType.AROMATIC,
-        }.get(order)
-        if bond_type is None:
-            raise ValueError(f"Unsupported CDXML bond order: {order}")
-        editable.AddBond(atom_index[begin], atom_index[end], bond_type)
-
-    mol = editable.GetMol()
-    conformer = Chem.Conformer(mol.GetNumAtoms())
-    for node_id, index in atom_index.items():
-        x, y = (float(value) for value in node_by_id[node_id].get("p", "0 0").split())
-        conformer.SetAtomPosition(index, (x, -y, 0.0))
-    mol.AddConformer(conformer)
-    for bond in bond_records:
-        begin = replacement.get(bond.get("B"), bond.get("B"))
-        end = replacement.get(bond.get("E"), bond.get("E"))
-        if begin not in atom_index or end not in atom_index:
-            continue
-        rd_bond = mol.GetBondBetweenAtoms(atom_index[begin], atom_index[end])
-        if rd_bond is None:
-            continue
-        if bond.get("Display") == "WedgeBegin":
-            rd_bond.SetBondDir(Chem.BondDir.BEGINWEDGE)
-        elif bond.get("Display") == "WedgedHashBegin":
-            rd_bond.SetBondDir(Chem.BondDir.BEGINDASH)
-    Chem.SanitizeMol(mol)
-    Chem.AssignChiralTypesFromBondDirs(mol, conformer.GetId())
-    return mol
+    """Use RDKit's CDXML reader, which handles both wedge ends and nested fragments."""
+    molecules = Chem.MolsFromCDXMLFile(str(path), removeHs=False)
+    if len(molecules) != 1 or molecules[0] is None:
+        raise ValueError("The CDXML source must contain exactly one valid molecule.")
+    return molecules[0]
 
 
 def graph_signature(mol: Chem.Mol) -> dict:
@@ -181,6 +97,32 @@ def inchi_key(mol: Chem.Mol) -> str:
     return Chem.MolToInchiKey(molecule)
 
 
+def identity_summary(mol: Chem.Mol) -> dict:
+    """Return identity fields that catch graph, charge, and stereochemical drift."""
+    clean = Chem.RemoveHs(Chem.Mol(mol))
+    Chem.AssignStereochemistry(clean, cleanIt=True, force=True)
+    return {
+        "isomeric_smiles": isomeric_smiles(clean),
+        "inchi_key": inchi_key(clean),
+        "formula": rdMolDescriptors.CalcMolFormula(clean),
+        "formal_charge": Chem.GetFormalCharge(clean),
+        "heavy_atom_count": clean.GetNumAtoms(),
+        "graph": graph_signature(clean),
+    }
+
+
+def compare_identity(reference: Chem.Mol, candidate: Chem.Mol) -> dict:
+    left = identity_summary(reference)
+    right = identity_summary(candidate)
+    return {
+        "graph_match": left["graph"] == right["graph"],
+        "inchi_key_match": left["inchi_key"] == right["inchi_key"],
+        "stereochemistry_match": left["isomeric_smiles"] == right["isomeric_smiles"],
+        "formula_match": left["formula"] == right["formula"],
+        "formal_charge_match": left["formal_charge"] == right["formal_charge"],
+    }
+
+
 def build_3d(source: Chem.Mol, seed: int, conformers: int) -> Chem.Mol:
     molecule = Chem.AddHs(Chem.Mol(source), addCoords=True)
     params = AllChem.ETKDGv3()
@@ -213,6 +155,22 @@ def build_3d(source: Chem.Mol, seed: int, conformers: int) -> Chem.Mol:
 def main() -> int:
     args = parse_args()
     source = load_source(args)
+    Chem.AssignStereochemistry(source, cleanIt=True, force=True)
+    expected = Chem.MolFromSmiles(args.expected_smiles) if args.expected_smiles else None
+    if args.input and args.input.suffix.lower() == ".cdxml" and expected is None:
+        raise ValueError("CDXML input requires --expected-smiles to independently confirm its parsed 2D graph.")
+    if expected is not None:
+        Chem.SanitizeMol(expected)
+        Chem.AssignStereochemistry(expected, cleanIt=True, force=True)
+        source_reference = compare_identity(expected, source)
+    else:
+        source_reference = {"status": "approved_source_used_as_reference"}
+    if args.expected_formula and identity_summary(source)["formula"] != args.expected_formula:
+        raise ValueError("Source formula differs from --expected-formula; stop before 3D generation.")
+    if args.expected_charge is not None and Chem.GetFormalCharge(source) != args.expected_charge:
+        raise ValueError("Source formal charge differs from --expected-charge; stop before 3D generation.")
+    if expected is not None and not all(source_reference.values()):
+        raise ValueError("Parsed 2D source differs from --expected-smiles; stop before 3D generation.")
     for index, atom in enumerate(source.GetAtoms(), start=1):
         atom.SetAtomMapNum(index)
     product = build_3d(source, args.seed, args.conformers)
@@ -225,38 +183,65 @@ def main() -> int:
 
     source_smiles = isomeric_smiles(source)
     product_heavy = Chem.RemoveHs(product)
-    product_smiles = isomeric_smiles(product_heavy)
-    source_inchi = inchi_key(source)
-    product_inchi = inchi_key(product_heavy)
+    product_check = compare_identity(source, product_heavy)
+    source_identity = identity_summary(source)
+    product_identity = identity_summary(product_heavy)
     report = {
         "name": args.name,
         "source_isomeric_smiles": source_smiles,
-        "product_isomeric_smiles": product_smiles,
-        "source_inchi_key": source_inchi,
-        "product_inchi_key": product_inchi,
-        "formula": rdMolDescriptors.CalcMolFormula(source),
-        "formal_charge": Chem.GetFormalCharge(source),
-        "heavy_atom_count": source.GetNumAtoms(),
+        "product_isomeric_smiles": product_identity["isomeric_smiles"],
+        "source_inchi_key": source_identity["inchi_key"],
+        "product_inchi_key": product_identity["inchi_key"],
+        "formula": source_identity["formula"],
+        "formal_charge": source_identity["formal_charge"],
+        "heavy_atom_count": source_identity["heavy_atom_count"],
         "atom_count_with_hydrogen": product.GetNumAtoms(),
         "molecular_weight": Descriptors.MolWt(product),
-        "graph_match": graph_signature(source) == graph_signature(product_heavy),
-        "inchi_key_match": source_inchi == product_inchi,
-        "stereochemistry_match": source_smiles == product_smiles,
+        "source_reference_check": source_reference,
+        "product_check": product_check,
+        "graph_match": product_check["graph_match"],
+        "inchi_key_match": product_check["inchi_key_match"],
+        "stereochemistry_match": product_check["stereochemistry_match"],
+        "formula_match": product_check["formula_match"],
+        "formal_charge_match": product_check["formal_charge_match"],
         "seed": args.seed,
     }
     report["validated"] = all(
-        report[key] for key in ("graph_match", "inchi_key_match", "stereochemistry_match")
+        report[key]
+        for key in (
+            "graph_match", "inchi_key_match", "stereochemistry_match",
+            "formula_match", "formal_charge_match",
+        )
     )
 
+    source_copy = Chem.Mol(source)
+    AllChem.Compute2DCoords(source_copy)
+    writer = Chem.SDWriter(str(output / f"{args.name}_approved_2d.sdf"))
+    writer.write(source_copy)
+    writer.close()
     writer = Chem.SDWriter(str(output / f"{args.name}_3d.sdf"))
     writer.write(product)
     writer.close()
     Chem.MolToPDBFile(product, str(output / f"{args.name}_3d.pdb"))
     with (output / "atom_map.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["source_heavy_atom_index_1based", "element", "product_heavy_atom_index_1based"])
+        writer.writerow([
+            "source_heavy_atom_index_1based", "element", "formal_charge", "aromatic",
+            "product_heavy_atom_index_1based",
+        ])
         for atom in source.GetAtoms():
-            writer.writerow([atom.GetIdx() + 1, atom.GetSymbol(), atom.GetIdx() + 1])
+            writer.writerow([
+                atom.GetIdx() + 1, atom.GetSymbol(), atom.GetFormalCharge(),
+                atom.GetIsAromatic(), atom.GetIdx() + 1,
+            ])
+    with (output / "bond_audit.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["begin_1based", "end_1based", "bond_type", "aromatic", "stereo"])
+        for bond in source.GetBonds():
+            writer.writerow([
+                bond.GetBeginAtomIdx() + 1, bond.GetEndAtomIdx() + 1,
+                str(bond.GetBondType()), bond.GetIsAromatic(), str(bond.GetStereo()),
+            ])
     (output / "validation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
     return 0 if report["validated"] else 2
