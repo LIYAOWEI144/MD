@@ -73,6 +73,15 @@ Run a ligand-only `gmx grompp` check. For a complex, also run full-complex
 topology. Report whether the defect predates the refined ligand. Do not claim
 the complex is production-ready without a generated complex `.tpr`.
 
+## MD Handoff Contract
+
+Read [GROMACS handoff](references/gromacs-handoff.md) before preparing files
+for solvation, equilibration, or production. The delivery must preserve a
+complete compatible include chain and must not activate a ligand restraint
+block through a generic protein `POSRES` macro by accident. When a user
+supplies an MD command list, hand it to `gromacs-analysis-assistant` for a
+Chinese command review before declaring the package ready for manual use.
+
 State in `README.md`: input identity and protonation state, force-field and
 tool versions, parameter changes, QM level of theory, known limitations, exact
 validation commands, and which outputs have actually passed validation.
